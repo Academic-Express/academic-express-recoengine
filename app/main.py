@@ -1,58 +1,36 @@
-from typing import Annotated, TypedDict
-from pathlib import Path
+from typing import Annotated
 
 import torch
 import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer
-from fastapi import FastAPI, Depends
+from fastapi import Body, FastAPI, Path
 from pydantic import BaseModel
-from sqlmodel import Field, Session, SQLModel, create_engine, select, delete
+from sentence_transformers import SentenceTransformer
 from sqlalchemy.exc import NoResultFound
+from sqlmodel import delete, select
 
-ROOT_DIR = Path(__file__).parent.parent
-DATA_DIR = ROOT_DIR / "data"
-
-
-class ArxivMapping(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    arxiv_id: str = Field(index=True)
+from .common import DATA_DIR, OriginKey
+from .database import SessionDep, create_db_and_tables
+from .embeddings import EmbeddingStore
+from .models import MAPPING_CLASSES
 
 
-class ArxivEntry(BaseModel):
-    arxiv_id: str
+class Entry(BaseModel):
+    entry_id: str
     content: str
 
 
-class ArxivSearchQuery(BaseModel):
+class SearchQuery(BaseModel):
     queries: list[str]
     max_results: int
 
 
-class ArxivSearchResult(BaseModel):
-    arxiv_id: str
+class SearchResult(BaseModel):
+    entry_id: str
     score: float
 
 
-# Database
-sqlite_file_name = DATA_DIR / "db.sqlite3"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+### Model
 
-connect_args = {"check_same_thread": False}
-engine = create_engine(sqlite_url, connect_args=connect_args)
-
-
-def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
-
-
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-
-SessionDep = Annotated[Session, Depends(get_session)]
-
-# Model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = SentenceTransformer(
     "./pretrained_models/Alibaba-NLP/gte-large-en-v1.5",
@@ -63,34 +41,10 @@ model = SentenceTransformer(
 model_dim = model.get_sentence_embedding_dimension()
 
 
-class EmbeddingStore(TypedDict):
-    arxiv: torch.Tensor
-
+### Embeddings
 
 embedding_file_name = DATA_DIR / "embeddings.pt"
-embedding_store: EmbeddingStore
-
-
-def load_embeddings():
-    global embedding_store
-    try:
-        embedding_store = torch.load(
-            embedding_file_name, map_location=device, weights_only=True
-        )
-    except FileNotFoundError:
-        embedding_store = {}
-
-    if "arxiv" in embedding_store:
-        assert embedding_store["arxiv"].dim() == 2
-        assert embedding_store["arxiv"].size(1) == model_dim
-    else:
-        embedding_store["arxiv"] = torch.empty(
-            0, model_dim, dtype=torch.float32, device=device
-        )
-
-
-def save_embeddings():
-    torch.save(embedding_store, embedding_file_name)
+embedding_store = EmbeddingStore(embedding_file_name, model_dim, device=device)
 
 
 def expand_and_update_embeddings(
@@ -124,44 +78,51 @@ def expand_and_update_embeddings(
     return target
 
 
-# App
+### App
+
 app = FastAPI()
 
 
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
-    load_embeddings()
+    embedding_store.load()
 
 
 @app.on_event("shutdown")
 def on_shutdown():
-    save_embeddings()
+    embedding_store.save()
 
 
-@app.post("/arxiv/batch")
-def batch_add_arxiv_entries(entries: list[ArxivEntry], session: SessionDep) -> None:
+@app.post("/{origin}/batch")
+def batch_add_entries(
+    origin: Annotated[OriginKey, Path(title="条目来源")],
+    entries: Annotated[list[Entry], Body(title="条目列表")],
+    session: SessionDep,
+) -> None:
     """
-    批量添加或更新 arXiv 论文条目。
+    批量添加或更新条目。
     """
+    mapping_cls = MAPPING_CLASSES[origin]
+
     # Find the ids for the entries that already exist
-    arxiv_ids = [entry.arxiv_id for entry in entries]
+    entry_ids = [entry.entry_id for entry in entries]
     existing_entries = session.exec(
-        select(ArxivMapping).where(ArxivMapping.arxiv_id.in_(arxiv_ids))
+        select(mapping_cls).where(mapping_cls.entry_id.in_(entry_ids))
     ).all()
 
-    mappings = {entry.arxiv_id: entry for entry in existing_entries}
+    mappings = {entry.entry_id: entry for entry in existing_entries}
 
     # Allowing for the case where the entry already exists
     new_entries = [
-        ArxivMapping(arxiv_id=entry.arxiv_id)
+        mapping_cls(entry_id=entry.entry_id)
         for entry in entries
-        if entry.arxiv_id not in mappings
+        if entry.entry_id not in mappings
     ]
     session.add_all(new_entries)
     session.commit()
 
-    mappings.update({entry.arxiv_id: entry for entry in new_entries})
+    mappings.update({entry.entry_id: entry for entry in new_entries})
 
     # Encode the content
     contents = [entry.content for entry in entries]
@@ -170,57 +131,63 @@ def batch_add_arxiv_entries(entries: list[ArxivEntry], session: SessionDep) -> N
 
     # Update the embeddings
     indices = torch.tensor(
-        [mappings[entry.arxiv_id].id for entry in entries], device=device
+        [mappings[entry.entry_id].index for entry in entries], device=device
     )
-    embedding_store["arxiv"] = expand_and_update_embeddings(
-        embedding_store["arxiv"], embeddings, indices
+    embedding_store[origin] = expand_and_update_embeddings(
+        embedding_store[origin], embeddings, indices
     )
 
 
-@app.post("/arxiv/search")
-def search_arxiv_entries(
-    payload: ArxivSearchQuery, session: SessionDep
-) -> list[list[ArxivSearchResult]]:
+@app.post("/{origin}/search")
+def search_entries(
+    origin: Annotated[OriginKey, Path(title="条目来源")],
+    payload: Annotated[SearchQuery, Body(title="搜索请求")],
+    session: SessionDep,
+) -> list[list[SearchResult]]:
     """
-    搜索 arXiv 论文条目。
+    搜索条目。
     """
+    mapping_cls = MAPPING_CLASSES[origin]
+
     query_embeddings = model.encode(payload.queries, convert_to_tensor=True)
     query_embeddings = F.normalize(query_embeddings, p=2, dim=1)
 
-    arxiv_embeddings = embedding_store["arxiv"]
-    scores = query_embeddings @ arxiv_embeddings.T
+    entry_embeddings = embedding_store[origin]
+    scores = query_embeddings @ entry_embeddings.T
 
-    results: list[list[ArxivSearchResult]] = []
+    results: list[list[SearchResult]] = []
 
     for score in scores:
         top_scores, top_indices = score.topk(min(payload.max_results, len(score)))
         top_scores = top_scores.tolist()
         top_indices = top_indices.tolist()
 
-        search_results: list[ArxivSearchResult] = []
+        search_results: list[SearchResult] = []
         for score, index in zip(top_scores, top_indices):
             try:
                 entry = session.exec(
-                    select(ArxivMapping).where(ArxivMapping.id == index)
+                    select(mapping_cls).where(mapping_cls.index == index)
                 ).one()
             except NoResultFound:
                 continue
-            search_results.append(
-                ArxivSearchResult(arxiv_id=entry.arxiv_id, score=score)
-            )
+            search_results.append(SearchResult(entry_id=entry.entry_id, score=score))
 
         results.append(search_results)
 
     return results
 
 
-@app.post("/arxiv/clear")
-def clear_arxiv_entries(session: SessionDep) -> None:
+@app.post("/{origin}/clear")
+def clear_entries(
+    origin: Annotated[OriginKey, Path(title="条目来源")], session: SessionDep
+) -> None:
     """
-    清空 arXiv 论文条目。
+    清空条目。
     """
-    session.exec(delete(ArxivMapping))
-    embedding_store["arxiv"] = torch.empty(
+    mapping_cls = MAPPING_CLASSES[origin]
+
+    session.exec(delete(mapping_cls))
+    embedding_store[origin] = torch.empty(
         0, model_dim, dtype=torch.float32, device=device
     )
-    save_embeddings()
+    embedding_store.save()
