@@ -6,11 +6,12 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
-from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Session, SQLModel, create_engine, select, delete
 from sqlalchemy.exc import NoResultFound
 
 ROOT_DIR = Path(__file__).parent.parent
 DATA_DIR = ROOT_DIR / "data"
+
 
 class ArxivMapping(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -139,7 +140,7 @@ def on_shutdown():
 
 
 @app.post("/arxiv/batch")
-def batch_add_arxiv_entries(entries: list[ArxivEntry], session: SessionDep):
+def batch_add_arxiv_entries(entries: list[ArxivEntry], session: SessionDep) -> None:
     """
     批量添加或更新 arXiv 论文条目。
     """
@@ -164,7 +165,7 @@ def batch_add_arxiv_entries(entries: list[ArxivEntry], session: SessionDep):
 
     # Encode the content
     contents = [entry.content for entry in entries]
-    embeddings = model.encode(contents, convert_to_tensor=True)
+    embeddings = model.encode(contents, convert_to_tensor=True, show_progress_bar=True)
     embeddings = F.normalize(embeddings, p=2, dim=1)
 
     # Update the embeddings
@@ -211,3 +212,15 @@ def search_arxiv_entries(
         results.append(search_results)
 
     return results
+
+
+@app.post("/arxiv/clear")
+def clear_arxiv_entries(session: SessionDep) -> None:
+    """
+    清空 arXiv 论文条目。
+    """
+    session.exec(delete(ArxivMapping))
+    embedding_store["arxiv"] = torch.empty(
+        0, model_dim, dtype=torch.float32, device=device
+    )
+    save_embeddings()
