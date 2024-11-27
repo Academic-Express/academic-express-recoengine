@@ -29,6 +29,7 @@ class EmbeddingStore:
             self.store = {}
 
         for key in OriginKey:
+            key = key.value
             if key in self.store:
                 assert self.store[key].dim() == 2
                 assert self.store[key].size(1) == self.model_dim
