@@ -1,8 +1,10 @@
 from typing import Annotated
+import warnings
 
 import torch
 import torch.nn.functional as F
-from fastapi import Body, FastAPI, Path
+from fastapi import Body, Depends, FastAPI, HTTPException, Path
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.exc import NoResultFound
@@ -27,6 +29,26 @@ class SearchQuery(BaseModel):
 class SearchResult(BaseModel):
     entry_id: str
     score: float
+
+
+### Authorization
+
+security = HTTPBearer()
+
+try:
+    with open(DATA_DIR / "access_token", "r") as f:
+        access_token = f.read().strip()
+except FileNotFoundError:
+    warnings.warn(
+        "No access token found. Using the default access token.",
+        UserWarning,
+    )
+    access_token = "feed-engine-token"
+
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != access_token:
+        raise HTTPException(status_code=403, detail="Invalid access token.")
 
 
 ### Model
@@ -94,7 +116,7 @@ def on_shutdown():
     embedding_store.save()
 
 
-@app.post("/{origin}/batch")
+@app.post("/{origin}/batch", dependencies=[Depends(verify_token)])
 def batch_add_entries(
     origin: Annotated[OriginKey, Path(title="条目来源")],
     entries: Annotated[list[Entry], Body(title="条目列表")],
@@ -138,7 +160,7 @@ def batch_add_entries(
     )
 
 
-@app.post("/{origin}/search")
+@app.post("/{origin}/search", dependencies=[Depends(verify_token)])
 def search_entries(
     origin: Annotated[OriginKey, Path(title="条目来源")],
     payload: Annotated[SearchQuery, Body(title="搜索请求")],
@@ -177,7 +199,7 @@ def search_entries(
     return results
 
 
-@app.post("/{origin}/clear")
+@app.post("/{origin}/clear", dependencies=[Depends(verify_token)])
 def clear_entries(
     origin: Annotated[OriginKey, Path(title="条目来源")], session: SessionDep
 ) -> None:
@@ -190,4 +212,20 @@ def clear_entries(
     embedding_store[origin] = torch.empty(
         0, model_dim, dtype=torch.float32, device=device
     )
+    embedding_store.save()
+
+
+@app.post("/reload", dependencies=[Depends(verify_token)])
+def reload_embeddings() -> None:
+    """
+    重新加载嵌入。
+    """
+    embedding_store.load()
+
+
+@app.post("/save", dependencies=[Depends(verify_token)])
+def save_embeddings() -> None:
+    """
+    保存嵌入。
+    """
     embedding_store.save()
